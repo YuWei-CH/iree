@@ -278,6 +278,77 @@ func.func @scatter_update_scalar_2D(%arg0: tensor<4x3xi32>, %arg1: tensor<3x2xi3
 
 // -----
 
+// CHECK-LABEL: func.func @scatter_update_unit_index_dims
+func.func @scatter_update_unit_index_dims(%arg0: tensor<64x64x1x16x1xf32>,
+    %arg1: tensor<1x2xi32>, %arg2: tensor<1x1x1x1x16x1xf32>)
+    -> tensor<64x64x1x16x1xf32> {
+  %0 = "stablehlo.scatter"(%arg0, %arg1, %arg2) ( {
+  ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
+    "stablehlo.return"(%arg4) : (tensor<f32>) -> ()
+  }) {
+    indices_are_sorted = true,
+    scatter_dimension_numbers = #stablehlo.scatter<
+      update_window_dims = [1, 2, 3, 4, 5],
+      scatter_dims_to_operand_dims = [0, 1],
+      index_vector_dim = 1,
+    >,
+    unique_indices = true
+  } : (tensor<64x64x1x16x1xf32>, tensor<1x2xi32>, tensor<1x1x1x1x16x1xf32>)
+      -> tensor<64x64x1x16x1xf32>
+  return %0 : tensor<64x64x1x16x1xf32>
+}
+// CHECK:         %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK:         %[[ARG1:[a-zA-Z0-9]+]]
+// CHECK:         %[[ARG2:[a-zA-Z0-9]+]]
+// CHECK:         %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG2]]
+// CHECK-SAME:      tensor<1x1x1x1x16x1xf32> into tensor<1x1x16x1xf32>
+// CHECK:         %[[SCATTER:.+]] = iree_linalg_ext.scatter
+// CHECK-SAME:      unique_indices(true)
+// CHECK-SAME:      ins(%[[COLLAPSED]], %[[ARG1]] : tensor<1x1x16x1xf32>, tensor<1x2xi32>)
+// CHECK-SAME:      outs(%[[ARG0]] : tensor<64x64x1x16x1xf32>)
+// CHECK:           ^bb0(%[[V1:.+]]: f32, %[[V2:.+]]: f32):
+// CHECK:             iree_linalg_ext.yield %[[V1]]
+// CHECK:         return %[[SCATTER]]
+
+// -----
+
+// CHECK-LABEL: func.func @scatter_update_index_window_dims
+func.func @scatter_update_index_window_dims(%arg0: tensor<64x64x1x16x1xf32>,
+    %arg1: tensor<1x2xi32>, %arg2: tensor<1x1x2x1x16x1xf32>)
+    -> tensor<64x64x1x16x1xf32> {
+  %0 = "stablehlo.scatter"(%arg0, %arg1, %arg2) ( {
+  ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
+    "stablehlo.return"(%arg4) : (tensor<f32>) -> ()
+  }) {
+    indices_are_sorted = true,
+    scatter_dimension_numbers = #stablehlo.scatter<
+      update_window_dims = [1, 2, 3, 4, 5],
+      scatter_dims_to_operand_dims = [0, 1],
+      index_vector_dim = 1,
+    >,
+    unique_indices = true
+  } : (tensor<64x64x1x16x1xf32>, tensor<1x2xi32>, tensor<1x1x2x1x16x1xf32>)
+      -> tensor<64x64x1x16x1xf32>
+  return %0 : tensor<64x64x1x16x1xf32>
+}
+// CHECK:         %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK:         %[[ARG1:[a-zA-Z0-9]+]]
+// CHECK:         %[[ARG2:[a-zA-Z0-9]+]]
+// CHECK:         %[[BCAST:.+]] = stablehlo.broadcast_in_dim %[[ARG1]], dims = [0, 3]
+// CHECK-SAME:      tensor<1x1x2x2xi32>
+// CHECK:         %[[IOTA:.+]] = stablehlo.iota dim = 2 : tensor<1x1x2x2xi32>
+// CHECK:         %[[OFFSET:.+]] = stablehlo.select
+// CHECK:         %[[INDICES:.+]] = stablehlo.add %[[BCAST]], %[[OFFSET]]
+// CHECK:         %[[SCATTER:.+]] = iree_linalg_ext.scatter
+// CHECK-SAME:      unique_indices(true)
+// CHECK-SAME:      ins(%[[ARG2]], %[[INDICES]] : tensor<1x1x2x1x16x1xf32>, tensor<1x1x2x2xi32>)
+// CHECK-SAME:      outs(%[[ARG0]] : tensor<64x64x1x16x1xf32>)
+// CHECK:           ^bb0(%[[V1:.+]]: f32, %[[V2:.+]]: f32):
+// CHECK:             iree_linalg_ext.yield %[[V1]]
+// CHECK:         return %[[SCATTER]]
+
+// -----
+
 // CHECK-LABEL: func.func @scatter_update_slice_2D
 func.func @scatter_update_slice_2D(%arg0: tensor<6x3xi32>, %arg1: tensor<2x1xi32>,
     %arg2: tensor<2x3xi32>) -> tensor<6x3xi32> {

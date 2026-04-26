@@ -1669,9 +1669,16 @@ static LogicalResult setContractConfig(IREE::GPU::TargetAttr target,
 
     // SIMT matmul case. Query the best configuration.
     SmallVector<TileWorkgroupSizePair> tileSizeConfig = getMatmulConfig(target);
+    auto isDegenerateUnitTile = [&](const TileWorkgroupSizePair &config) {
+      return (config.tileSize[0] == 1 && sizeM > kVerySkinnyDimThreshold) ||
+             (config.tileSize[1] == 1 && sizeN > kVerySkinnyDimThreshold);
+    };
     // Pick the best configuration where the original shape is aligned on the
     // tile size.
     for (TileWorkgroupSizePair &config : tileSizeConfig) {
+      if (isDegenerateUnitTile(config)) {
+        continue;
+      }
       if (sizeN % config.tileSize[1] == 0 && sizeM % config.tileSize[0] == 0 &&
           sizeK % config.tileSize[2] == 0) {
         return setMatmulConfig(

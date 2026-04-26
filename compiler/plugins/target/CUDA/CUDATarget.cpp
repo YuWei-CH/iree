@@ -422,8 +422,14 @@ public:
       return nullptr;
     }
 
-    if (auto target = GPU::getCUDATargetDetails(
-            options.clTarget, options.clTargetFeatures, context)) {
+    std::string targetFeatures = options.clTargetFeatures;
+    if (GPU::normalizeCUDATarget(options.clTarget) == "sm_89" &&
+        targetFeatures == "+ptx76") {
+      targetFeatures = "+ptx78";
+    }
+
+    if (auto target = GPU::getCUDATargetDetails(options.clTarget,
+                                                targetFeatures, context)) {
       addConfigGPUTarget(context, target, configItems);
     }
 

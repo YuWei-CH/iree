@@ -68,6 +68,62 @@ Type convertShapedToSignless(ShapedType shapedType) {
   return shapedType;
 }
 
+Value createIntegerScalar(ImplicitLocOpBuilder &b, Type elementType,
+                          int64_t value) {
+  auto scalarType = RankedTensorType::get({}, elementType);
+  auto attr =
+      DenseElementsAttr::get(scalarType, b.getIntegerAttr(elementType, value));
+  return mlir::stablehlo::ConstantOp::create(b, attr);
+}
+
+Value broadcastIntegerScalar(ImplicitLocOpBuilder &b, RankedTensorType type,
+                             int64_t value) {
+  Value scalar = createIntegerScalar(b, type.getElementType(), value);
+  return mlir::stablehlo::BroadcastInDimOp::create(b, type, scalar,
+                                                   ArrayRef<int64_t>{});
+}
+
+Value expandScatterIndices(ImplicitLocOpBuilder &b, Value indices,
+                           ArrayRef<int64_t> updateWindowShape,
+                           int64_t batchRank, int64_t indexDepth) {
+  auto indicesType = cast<RankedTensorType>(indices.getType());
+  SmallVector<int64_t> expandedShape;
+  llvm::append_range(expandedShape,
+                     indicesType.getShape().take_front(batchRank));
+  llvm::append_range(expandedShape, updateWindowShape);
+  expandedShape.push_back(indexDepth);
+
+  auto expandedType =
+      RankedTensorType::get(expandedShape, indicesType.getElementType());
+  SmallVector<int64_t> broadcastDims;
+  for (int64_t dim : llvm::seq<int64_t>(0, batchRank)) {
+    broadcastDims.push_back(dim);
+  }
+  broadcastDims.push_back(expandedType.getRank() - 1);
+  Value expandedIndices = mlir::stablehlo::BroadcastInDimOp::create(
+      b, expandedType, indices, broadcastDims);
+
+  Value zero = broadcastIntegerScalar(b, expandedType, 0);
+  Value componentIota = mlir::stablehlo::IotaOp::create(
+      b, expandedType, expandedType.getRank() - 1);
+  for (auto [idx, dim] : llvm::enumerate(updateWindowShape)) {
+    if (dim == 1) {
+      continue;
+    }
+    Value updateIota =
+        mlir::stablehlo::IotaOp::create(b, expandedType, batchRank + idx);
+    Value component = broadcastIntegerScalar(b, expandedType, idx);
+    Value isComponent = mlir::stablehlo::CompareOp::create(
+        b, componentIota, component, mlir::stablehlo::ComparisonDirection::EQ);
+    Value offset =
+        mlir::stablehlo::SelectOp::create(b, isComponent, updateIota, zero);
+    expandedIndices =
+        mlir::stablehlo::AddOp::create(b, expandedIndices, offset);
+  }
+
+  return expandedIndices;
+}
+
 Value materializeCast(OpBuilder &builder, Type toType, ValueRange inputs,
                       Location loc) {
   assert(inputs.size() == 1 && "too many inputs to type conversion");
@@ -274,12 +330,52 @@ struct ScatterOpConversion final
     Value indices = adaptor.getScatterIndices();
     Value updates = adaptor.getUpdates().front();
 
-    auto originalType = dyn_cast<ShapedType>(original.getType());
+    auto originalType = cast<ShapedType>(original.getType());
+    auto indicesType = cast<ShapedType>(indices.getType());
+    auto updatesType = cast<RankedTensorType>(updates.getType());
 
     llvm::SmallVector<int64_t> scatterDimMap;
     for (auto dim :
          op.getScatterDimensionNumbers().getScatterDimsToOperandDims()) {
       scatterDimMap.push_back(dim);
+    }
+
+    int64_t indexDepth = scatterDimMap.size();
+    int64_t batchRank = indicesType.getRank() - 1;
+    int64_t originalSliceRank = originalType.getRank() - indexDepth;
+    int64_t expectedUpdatesRank = batchRank + originalSliceRank;
+    if (updatesType.getRank() > expectedUpdatesRank) {
+      int64_t droppedRank = updatesType.getRank() - expectedUpdatesRank;
+      ArrayRef<int64_t> updateWindowShape =
+          updatesType.getShape().slice(batchRank, droppedRank);
+      if (llvm::any_of(updateWindowShape, ShapedType::isDynamic)) {
+        return rewriter.notifyMatchFailure(
+            op, "expected static extra update dimensions");
+      }
+      if (llvm::all_of(updateWindowShape,
+                       [](int64_t dim) { return dim == 1; })) {
+        SmallVector<int64_t> collapsedShape;
+        llvm::append_range(collapsedShape,
+                           updatesType.getShape().take_front(batchRank));
+        llvm::append_range(collapsedShape,
+                           updatesType.getShape().take_back(originalSliceRank));
+        std::optional<SmallVector<ReassociationIndices>> reassociation =
+            getReassociationIndicesForCollapse(updatesType.getShape(),
+                                               collapsedShape);
+        if (!reassociation) {
+          return rewriter.notifyMatchFailure(
+              op, "failed to compute update collapse reassociation");
+        }
+        updates = tensor::CollapseShapeOp::create(
+            rewriter, op.getLoc(), updates, reassociation.value());
+      } else {
+        if (droppedRank != indexDepth) {
+          return rewriter.notifyMatchFailure(
+              op, "expected update window dimensions for each indexed dim");
+        }
+        indices = expandScatterIndices(b, indices, updateWindowShape, batchRank,
+                                       indexDepth);
+      }
     }
 
     auto scatterOp = IREE::LinalgExt::ScatterOp::create(
@@ -752,6 +848,14 @@ struct ConvertStableHloToLinalgExt final
     // We deliberately allow unrealized casts to persist. These should fall away
     // when the rest of StableHlo is converted.
     target.addLegalOp<UnrealizedConversionCastOp>();
+    // Scatter conversion may materialize index calculations that are still
+    // represented in StableHLO. These are lowered by the following
+    // StableHLO-to-IREE-input conversion pass.
+    target.addDynamicallyLegalOp<
+        mlir::stablehlo::AddOp, mlir::stablehlo::BroadcastInDimOp,
+        mlir::stablehlo::CompareOp, mlir::stablehlo::ConstantOp,
+        mlir::stablehlo::IotaOp, mlir::stablehlo::SelectOp>(
+        [](Operation *op) { return !isInBodyOfLinalgExtOps(op); });
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns)))) {

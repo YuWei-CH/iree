@@ -189,6 +189,7 @@ static std::tuple<Type, Type, Type> getABCElementTypes(MLIRContext *context,
   case MMAIntrinsic::MFMA_F32_32x32x16_BF16:
   case MMAIntrinsic::WMMAR3_F32_16x16x16_BF16:
   case MMAIntrinsic::WMMAR4_F32_16x16x16_BF16:
+  case MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_BF16:
   case MMAIntrinsic::WMMA_F32_16x16x32_BF16:
     return {bf16, bf16, f32};
   case MMAIntrinsic::WMMAR3_BF16_16x16x16_BF16:
@@ -707,6 +708,7 @@ MMASingleSubgroupLayout getSingleSubgroupLayout(MMAIntrinsic intrinsic,
     }
   case MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_F16:
   case MMAIntrinsic::NV_MMA_SYNC_F16_16x8x16_F16:
+  case MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_BF16:
     switch (operandIndex) {
     case kMMAOperandLhs:
       return {/*outer=*/{2, 2}, /*thread=*/{8, 4}, /*strides=*/{4, 1},
@@ -1082,7 +1084,8 @@ static Value createMmaOp(OpBuilder &builder, Location loc,
     // ordering expected by mma.sync. The input shape differs between pipelines:
     // VectorDistribute produces 2x2x1x2, TileAndFuse produces 2x1x2x2.
     // Remove the unit dimension to simplify the transpose.
-    auto nonUnitVecType = VectorType::get({2, 2, 2}, builder.getF16Type());
+    Type elementType = cast<VectorType>(lhs.getType()).getElementType();
+    auto nonUnitVecType = VectorType::get({2, 2, 2}, elementType);
     auto reshaped =
         vector::ShapeCastOp::create(builder, loc, nonUnitVecType, lhs);
     auto permAttr = builder.getDenseI64ArrayAttr({1, 0, 2});

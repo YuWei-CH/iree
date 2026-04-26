@@ -2624,18 +2624,28 @@ LogicalResult initGPULaunchConfig(FunctionOpInterface funcOp) {
 
     if (auto scatterOp = dyn_cast<IREE::LinalgExt::ScatterOp>(op)) {
       Value indices = scatterOp.getIndices();
-      if (!indices.getDefiningOp()) {
-        continue;
-      }
-
-      // Mark scatter's backward slices(inclusive) as to skip.
       BackwardSliceOptions options;
       options.inclusive = true;
       SetVector<Operation *> slices;
-      [[maybe_unused]] LogicalResult result =
-          getBackwardSlice(indices, &slices, options);
-      assert(result.succeeded());
-      genericToSkip.insert(slices.begin(), slices.end());
+
+      // Mark scatter index producers as not-root operations.
+      if (indices.getDefiningOp()) {
+        [[maybe_unused]] LogicalResult result =
+            getBackwardSlice(indices, &slices, options);
+        assert(result.succeeded());
+        genericToSkip.insert(slices.begin(), slices.end());
+        slices.clear();
+      }
+
+      // Mark scatter update producers as not-root operations. The scatter is
+      // the operation that performs the final write, so selecting an update
+      // producer as root can leave the scatter outside workgroup distribution.
+      if (scatterOp.getUpdates().getDefiningOp()) {
+        [[maybe_unused]] LogicalResult result =
+            getBackwardSlice(scatterOp.getUpdates(), &slices, options);
+        assert(result.succeeded());
+        genericToSkip.insert(slices.begin(), slices.end());
+      }
     }
   }
 

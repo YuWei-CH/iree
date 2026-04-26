@@ -1620,6 +1620,14 @@ LogicalResult setTileAndFuseLoweringConfig(IREE::GPU::TargetAttr target,
                             {flatWorkgroupSize, 1, 1}, subgroupSize));
 }
 
+static bool hasAtMostOneScatterUpdate(IREE::LinalgExt::ScatterOp scatter) {
+  ArrayRef<int64_t> batchShape = scatter.getBatchShape();
+  if (llvm::any_of(batchShape, ShapedType::isDynamic)) {
+    return false;
+  }
+  return llvm::product_of(batchShape) <= 1;
+}
+
 LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
                                        mlir::FunctionOpInterface entryPoint,
                                        Operation *op) {
@@ -1628,8 +1636,10 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
     return failure();
   }
 
-  // TODO: Support non-unique indices.
-  if (!scatter.getUniqueIndices()) {
+  // Non-unique indices imply reduction semantics over the batch dimensions.
+  // With at most one batch update there cannot be an inter-update conflict, so
+  // the scatter can use the same lowering as unique-index scatters.
+  if (!scatter.getUniqueIndices() && !hasAtMostOneScatterUpdate(scatter)) {
     return failure();
   }
 

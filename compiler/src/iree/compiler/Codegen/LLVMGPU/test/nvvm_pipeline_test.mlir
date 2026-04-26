@@ -500,3 +500,44 @@ func.func @scatter_update_only_indexed_dim() attributes {hal.executable.target =
 //             CHECK:   llvm.store
 //        SM80-LABEL: llvm.func @scatter_update_only_indexed_dim
 //              SM80:   llvm.store
+
+// -----
+
+#executable_target_cuda = #hal.executable.target<"cuda", "cuda-nvptx-fb">
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+func.func @scatter_single_update_with_generic_producer() attributes {hal.executable.target = #executable_target_cuda} {
+  %c0 = arith.constant 0 : index
+  %updates = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x1x2x256xf32>>
+  %indices = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1xi32>>
+  %output = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<readwrite:tensor<256x1x2x256xf32>>
+  %updates_t = iree_tensor_ext.dispatch.tensor.load %updates, offsets = [0, 0, 0, 0], sizes = [1, 1, 2, 256], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x1x2x256xf32>> -> tensor<1x1x2x256xf32>
+  %indices_t = iree_tensor_ext.dispatch.tensor.load %indices, offsets = [0], sizes = [1], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1xi32>> -> tensor<1xi32>
+  %original_t = iree_tensor_ext.dispatch.tensor.load %output, offsets = [0, 0, 0, 0], sizes = [256, 1, 2, 256], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readwrite:tensor<256x1x2x256xf32>> -> tensor<256x1x2x256xf32>
+  %empty = tensor.empty() : tensor<1x1x2x256xf32>
+  %update_producer = linalg.generic {
+      indexing_maps = [
+        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%updates_t : tensor<1x1x2x256xf32>)
+      outs(%empty : tensor<1x1x2x256xf32>) {
+  ^bb0(%update: f32, %out: f32):
+    %scaled = arith.addf %update, %update : f32
+    linalg.yield %scaled : f32
+  } -> tensor<1x1x2x256xf32>
+  %scatter = iree_linalg_ext.scatter dimension_map = [0] unique_indices(false) ins(%update_producer, %indices_t : tensor<1x1x2x256xf32>, tensor<1xi32>) outs(%original_t : tensor<256x1x2x256xf32>) {
+  ^bb0(%update: f32, %old: f32):
+    iree_linalg_ext.yield %update : f32
+  } -> tensor<256x1x2x256xf32>
+  iree_tensor_ext.dispatch.tensor.store %scatter, %output, offsets = [0, 0, 0, 0], sizes = [256, 1, 2, 256], strides = [1, 1, 1, 1] : tensor<256x1x2x256xf32> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<256x1x2x256xf32>>
+  return
+}
+
+//       CHECK-LABEL: llvm.func @scatter_single_update_with_generic_producer
+//             CHECK:   llvm.store
+//        SM80-LABEL: llvm.func @scatter_single_update_with_generic_producer
+//              SM80:   llvm.store

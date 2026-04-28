@@ -14,6 +14,7 @@ iree_lit_test_suite(
   NAME
     lit
   SRCS
+    "config_cuda_matvec_vector_distribute.mlir"
     "config_tile_and_fuse_sm80.mlir"
     "config_vector_distribute_sm80.mlir"
     "pipeline_full_smoketests.mlir"

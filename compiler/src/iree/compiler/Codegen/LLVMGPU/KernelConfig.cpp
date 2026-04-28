@@ -80,6 +80,18 @@ static llvm::cl::opt<bool> clGPUEnableReductionVectorDistribution(
         "enable the usage of the reduction vector distribution pipeline"),
     llvm::cl::init(true));
 
+static llvm::cl::opt<bool> clGPUEnableCUDAMatvecVectorDistribution(
+    "iree-codegen-llvmgpu-use-cuda-matvec-vector-distribution",
+    llvm::cl::desc("enable the vector distribution pipeline for CUDA "
+                   "matvec-like contractions"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<int64_t> clGPUCUDAMatvecMaxParallelSize(
+    "iree-codegen-llvmgpu-cuda-matvec-max-parallel-size",
+    llvm::cl::desc("maximum non-unit parallel dimension size for CUDA "
+                   "matvec-like contractions to use vector distribution"),
+    llvm::cl::init(8192));
+
 // TODO (nirvedhmeshram): Drop this whole path after we have support with
 // TileAndFuse pipeline from completion of
 // https://github.com/iree-org/iree/issues/18858
@@ -187,6 +199,10 @@ constexpr unsigned softwarePipelineDepthSimt = 0;
 
 static bool isROCmBackend(IREE::GPU::TargetAttr target) {
   return target.getArch().starts_with("gfx");
+}
+
+static bool isCUDABackend(IREE::GPU::TargetAttr target) {
+  return target.getArch().starts_with("sm_");
 }
 
 static bool needsLoweringConfigPropagation(Attribute pipelineAttr) {
@@ -2007,6 +2023,83 @@ static bool isMatvecLike(linalg::LinalgOp linalgOp) {
   return true;
 }
 
+static bool hasCUDAMatvecVectorDistributionTypes(linalg::LinalgOp linalgOp) {
+  if (linalgOp.getNumDpsInputs() < 2 || linalgOp.getNumDpsInits() != 1) {
+    return false;
+  }
+
+  Type input0Type = getElementTypeOrSelf(linalgOp.getDpsInputOperand(0)->get());
+  Type input1Type = getElementTypeOrSelf(linalgOp.getDpsInputOperand(1)->get());
+  Type initType = getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get());
+
+  auto isF32OrBF16 = [](Type type) {
+    return type.isF32() || isa<BFloat16Type>(type);
+  };
+
+  return isF32OrBF16(input0Type) && isF32OrBF16(input1Type) &&
+         isF32OrBF16(initType);
+}
+
+static std::optional<int64_t> getSingleNonUnitParallelBound(
+    linalg::LinalgOp linalgOp, ArrayRef<int64_t> bounds) {
+  SmallVector<unsigned> parallelDims;
+  linalgOp.getParallelDims(parallelDims);
+
+  std::optional<int64_t> nonUnitBound;
+  for (unsigned dim : parallelDims) {
+    if (bounds[dim] == 1) {
+      continue;
+    }
+    if (nonUnitBound) {
+      return std::nullopt;
+    }
+    nonUnitBound = bounds[dim];
+  }
+  return nonUnitBound;
+}
+
+static bool isSmallStaticCUDAMatvec(IREE::GPU::TargetAttr target,
+                                    linalg::LinalgOp linalgOp) {
+  if (!clGPUEnableCUDAMatvecVectorDistribution ||
+      !clGPUEnableReductionVectorDistribution || !isCUDABackend(target) ||
+      !isMatvecLike(linalgOp) ||
+      !hasCUDAMatvecVectorDistributionTypes(linalgOp)) {
+    return false;
+  }
+
+  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+  if (!ShapedType::isStaticShape(bounds)) {
+    return false;
+  }
+
+  std::optional<int64_t> parallelBound =
+      getSingleNonUnitParallelBound(linalgOp, bounds);
+  if (!parallelBound || *parallelBound > clGPUCUDAMatvecMaxParallelSize) {
+    return false;
+  }
+
+  SmallVector<unsigned> reductionDims;
+  linalgOp.getReductionDims(reductionDims);
+  return llvm::hasSingleElement(reductionDims) &&
+         bounds[reductionDims.front()] >= 1024;
+}
+
+static linalg::LinalgOp findSmallStaticCUDAMatvec(
+    IREE::GPU::TargetAttr target, linalg::LinalgOp rootOp) {
+  if (isSmallStaticCUDAMatvec(target, rootOp)) {
+    return rootOp;
+  }
+
+  for (OpOperand *input : rootOp.getDpsInputOperands()) {
+    auto producer = input->get().getDefiningOp<linalg::LinalgOp>();
+    if (producer && isSmallStaticCUDAMatvec(target, producer)) {
+      return producer;
+    }
+  }
+
+  return nullptr;
+}
+
 static bool hasTwoOrThreeLoopsInfo(linalg::LinalgOp linalgOp) {
   return linalgOp.getNumParallelLoops() >= 2 &&
          linalgOp.getNumParallelLoops() <= 3;
@@ -2437,6 +2530,14 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
     if (succeeded(setContractConfig(target, entryPointFn, linalgOp))) {
       LDBG() << "Contract Config";
       return success();
+    }
+    if (linalg::LinalgOp matvecOp =
+            findSmallStaticCUDAMatvec(target, linalgOp)) {
+      if (succeeded(IREE::GPU::setReductionConfig(
+              target, entryPointFn, matvecOp.getOperation()))) {
+        LDBG() << "CUDA Matvec Vector Distribution Config";
+        return success();
+      }
     }
     if (clGPUEnableOuterReductionTileAndFuse) {
       if (isOuterReduction(linalgOp)) {

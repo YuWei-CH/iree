@@ -37,10 +37,27 @@ bool isROCmBackend(IREE::GPU::TargetAttr target) {
   return target.getArch().starts_with("gfx");
 }
 
+bool isCUDABackend(IREE::GPU::TargetAttr target) {
+  return target.getArch().starts_with("sm_");
+}
+
 static bool isMatmulLike(linalg::LinalgOp linalgOp) {
   return linalg::isaContractionOpInterface(linalgOp) &&
          linalgOp.getNumParallelLoops() >= 1;
 };
+
+static bool isMatvecLike(linalg::LinalgOp linalgOp,
+                         ArrayRef<int64_t> bounds) {
+  if (!isMatmulLike(linalgOp) || linalgOp.getNumReductionLoops() != 1) {
+    return false;
+  }
+
+  SmallVector<unsigned> parallelDims;
+  linalgOp.getParallelDims(parallelDims);
+  unsigned nonUnitParallelDims = llvm::count_if(
+      parallelDims, [&bounds](unsigned idx) { return bounds[idx] != 1; });
+  return nonUnitParallelDims == 1;
+}
 
 static SmallVector<unsigned> getParallelDims(Operation *op) {
   SmallVector<unsigned> result;
@@ -314,11 +331,13 @@ getVectorDistributeReductionConfig(Operation *op, IREE::GPU::TargetAttr target,
   SmallVector<int64_t> partialReductionTileSizes(numLoops, 0);
   int64_t lastReductionDim = reductionDims.back();
 
-  // TODO: This is enabled for matvec on ROCm for now. We should
-  // validate this strategy and extend to more linalg generics and to CUDA.
+  // Keep each workgroup responsible for a small contiguous output slice. This
+  // is important for matvec-like reductions: pure split-K with one output per
+  // workgroup creates excessive workgroups on CUDA, while large output tiles
+  // starve the device on small-P GEMVs.
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-  if (linalgOp && isROCmBackend(target) && ShapedType::isStaticShape(bounds) &&
-      isMatmulLike(linalgOp)) {
+  if (linalgOp && (isROCmBackend(target) || isCUDABackend(target)) &&
+      ShapedType::isStaticShape(bounds) && isMatvecLike(linalgOp, bounds)) {
     int64_t parallelIdx = *llvm::find_if(
         parallelDims, [&](int64_t currIdx) { return bounds[currIdx] != 1; });
     int64_t parallelBound = bounds[parallelIdx];

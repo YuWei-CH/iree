@@ -950,28 +950,53 @@ bool isArgmaxOp(linalg::GenericOp genericOp) {
     return false;
   }
 
-  // Work back from linalg.yield and check body of genericOp.
-  // The genericOp should yield the result of an arith.select,
-  // preceded by an arith.cmpf, arith.maximumf, and arith.extui
+  auto isCurrentReductionIndex = [](Value value) {
+    if (auto castOp = value.getDefiningOp<arith::IndexCastOp>()) {
+      value = castOp.getIn();
+    }
+    return static_cast<bool>(value.getDefiningOp<linalg::IndexOp>());
+  };
+  auto stripFloatCast = [](Value value) {
+    if (auto extOp = value.getDefiningOp<arith::ExtFOp>()) {
+      return extOp.getIn();
+    }
+    if (auto truncOp = value.getDefiningOp<arith::TruncFOp>()) {
+      return truncOp.getIn();
+    }
+    return value;
+  };
+
+  // Work back from linalg.yield and check body of genericOp. Accept both the
+  // canonical maximumf/select form and StableHLO/JAX's select-based argmax
+  // expansion, which directly selects either the incoming value/index or the
+  // current max value/index.
   auto yieldOp = cast<linalg::YieldOp>(genericOp.getBody()->getTerminator());
   Value producerOutput;
   Operation *producer;
 
-  // Producer of linalg.yield 1st arg is arith.maximumf
+  // Producer of linalg.yield 1st arg is arith.maximumf or arith.select.
   {
     producerOutput = yieldOp->getOperand(0);
     producer = producerOutput.getDefiningOp();
     if (!producer || producer->getNumOperands() == 0) {
       return false;
     }
-    if (!matchPattern(producer, m_Op<arith::MaximumFOp>())) {
+    if (!isa<arith::MaximumFOp, arith::SelectOp>(producer)) {
       return false;
+    }
+    if (auto selectOp = dyn_cast<arith::SelectOp>(producer)) {
+      Value trueVal = stripFloatCast(selectOp.getTrueValue());
+      Value falseVal = stripFloatCast(selectOp.getFalseValue());
+      Value inVal = genericOp.getBody()->getArgument(0);
+      Value outVal = genericOp.getBody()->getArgument(1);
+      if (!((trueVal == inVal && falseVal == outVal) ||
+            (trueVal == outVal && falseVal == inVal))) {
+        return false;
+      }
     }
   }
 
   // Producer of linalg.yield op 2nd arg is arith.select
-  // TODO: Add check that select is selecting between linalg.index and index of
-  // current max.
   {
     producerOutput = yieldOp->getOperand(1);
     producer = producerOutput.getDefiningOp();
@@ -983,18 +1008,22 @@ bool isArgmaxOp(linalg::GenericOp genericOp) {
     }
     auto selectOp = cast<arith::SelectOp>(producerOutput.getDefiningOp());
     Value trueVal = selectOp.getTrueValue();
-    if (auto castOp = trueVal.getDefiningOp<arith::IndexCastOp>()) {
-      trueVal = castOp.getIn();
+    Value falseVal = selectOp.getFalseValue();
+    bool trueIsIndex = isCurrentReductionIndex(trueVal);
+    bool falseIsIndex = isCurrentReductionIndex(falseVal);
+    if (trueIsIndex == falseIsIndex) {
+      return false;
     }
-
-    // Ensure the true value is directly produced by linalg.index.
-    auto indexOp = trueVal.getDefiningOp<linalg::IndexOp>();
-    if (!indexOp) {
+    Value carriedIndex = trueIsIndex ? falseVal : trueVal;
+    if (carriedIndex != genericOp.getBody()->getArgument(2)) {
       return false;
     }
   }
 
-  // Producer of arith.select op is arith.cmpf
+  // Producer of arith.select condition is usually arith.cmpf. StableHLO/JAX
+  // argmax may combine comparisons with boolean ops for NaN and tie handling;
+  // in that case the value/index select checks above are enough to identify the
+  // argmax shape for split reduction.
   {
     producerOutput = producer->getOperand(0);
     producer = producerOutput.getDefiningOp();
@@ -1002,17 +1031,17 @@ bool isArgmaxOp(linalg::GenericOp genericOp) {
       return false;
     }
     auto producerCmpFOp = dyn_cast<arith::CmpFOp>(producer);
-    if (!producerCmpFOp ||
-        producerCmpFOp.getPredicate() != arith::CmpFPredicate::OGT) {
-      return false;
-    }
-
-    // Check that in and out of cmpf are loop variables.
-    // Currently first operand is disabled because it may be mixed type
-    // which would lead it to be extf(%arg0).
-    // TODO: Add better mixed type support check.
-    if (producer->getOperand(1) != genericOp.getBody()->getArgument(1)) {
-      return false;
+    if (producerCmpFOp) {
+      if (producerCmpFOp.getPredicate() != arith::CmpFPredicate::OGT) {
+        return false;
+      }
+      // Check that in and out of cmpf are loop variables.
+      // Currently first operand is disabled because it may be mixed type
+      // which would lead it to be extf(%arg0).
+      // TODO: Add better mixed type support check.
+      if (producer->getOperand(1) != genericOp.getBody()->getArgument(1)) {
+        return false;
+      }
     }
   }
 

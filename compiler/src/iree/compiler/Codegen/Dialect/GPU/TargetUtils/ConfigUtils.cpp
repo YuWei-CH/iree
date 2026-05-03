@@ -18,6 +18,7 @@
 #include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
@@ -1628,6 +1629,39 @@ static bool hasAtMostOneScatterUpdate(IREE::LinalgExt::ScatterOp scatter) {
   return llvm::product_of(batchShape) <= 1;
 }
 
+static bool isReadOnlyInterfaceBuffer(Value value) {
+  auto load = value.getDefiningOp<IREE::Codegen::LoadFromBufferOp>();
+  if (!load) {
+    return false;
+  }
+  std::optional<IREE::HAL::InterfaceBindingSubspanOp> subspan =
+      getSourceSubspanMemref(cast<TypedValue<MemRefType>>(load.getBuffer()));
+  if (!subspan) {
+    return false;
+  }
+  std::optional<IREE::HAL::DescriptorFlags> descriptorFlags =
+      subspan->getDescriptorFlags();
+  return descriptorFlags.has_value() &&
+         bitEnumContainsAll(*descriptorFlags,
+                            IREE::HAL::DescriptorFlags::ReadOnly);
+}
+
+static LogicalResult setScatterDistributeLoweringConfig(
+    mlir::FunctionOpInterface entryPoint, IREE::LinalgExt::ScatterOp scatter,
+    ArrayRef<int64_t> loopBounds, int64_t flatWorkgroupSize) {
+  if (llvm::any_of(loopBounds, ShapedType::isDynamic)) {
+    return failure();
+  }
+  TileSizesListType tileSizes = {SmallVector<int64_t>(loopBounds)};
+  std::array<int64_t, 3> workgroupSize = {2 * flatWorkgroupSize, 1, 1};
+  auto loweringConfig =
+      IREE::Codegen::LoweringConfigAttr::get(scatter.getContext(), tileSizes);
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPoint, scatter, loweringConfig,
+      getGPUTranslationInfo(scatter.getContext(), LoweringPipeline::Distribute,
+                            workgroupSize, flatWorkgroupSize));
+}
+
 LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
                                        mlir::FunctionOpInterface entryPoint,
                                        Operation *op) {
@@ -1650,6 +1684,16 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
 
   // Configurations we need to decide.
   int64_t flatWorkgroupSize = target.getPreferredSubgroupSize();
+
+  // TileAndFuse bufferization cannot currently materialize the copy required
+  // for value-semantic scatter inits that come from read-only interface
+  // bindings. Use the distribute path, which can lower these scatters without
+  // introducing an in-place write to the read-only source.
+  if (isReadOnlyInterfaceBuffer(scatter.getOriginal())) {
+    return setScatterDistributeLoweringConfig(entryPoint, scatter, loopBounds,
+                                              flatWorkgroupSize);
+  }
+
   SmallVector<int64_t> workgroupTileSizes(loopDepth, 1);
   SmallVector<int64_t> threadTileSizes(loopDepth, 1);
   int64_t vectorSize = kPreferredCopyNumBits / elemBits;
@@ -1711,17 +1755,8 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
     // If the inner most slice is a single element then we have to bail out.
     // TODO: Support this case.
     if (!hasNonUnitInnerSlice) {
-      if (llvm::any_of(loopBounds, ShapedType::isDynamic)) {
-        return failure();
-      }
-      TileSizesListType tileSizes = {loopBounds};
-      std::array<int64_t, 3> workgroupSize = {2 * flatWorkgroupSize, 1, 1};
-      auto loweringConfig = IREE::Codegen::LoweringConfigAttr::get(
-          scatter.getContext(), tileSizes);
-      return setOpConfigAndEntryPointFnTranslation(
-          entryPoint, scatter, loweringConfig,
-          getGPUTranslationInfo(op->getContext(), LoweringPipeline::Distribute,
-                                workgroupSize, flatWorkgroupSize));
+      return setScatterDistributeLoweringConfig(entryPoint, scatter, loopBounds,
+                                                flatWorkgroupSize);
     }
   }
 

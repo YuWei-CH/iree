@@ -91,3 +91,39 @@ func.func @matmul_accumulate_256x256x256_f16_f32() {
 //       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
 //  CHECK-SAME:     convert_acc_gemm
 //  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<NV_MMA_SYNC_F32_16x8x16_F16>
+
+// -----
+
+// Scatters that preserve a read-only interface init need a value-semantic copy
+// before updates are applied. The TileAndFuse path cannot currently materialize
+// that copy, so configuration falls back to the Distribute pipeline.
+
+#pipeline_layout_scatter = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+func.func @scatter_readonly_init_distribute() {
+  %c0 = arith.constant 0 : index
+  %init = hal.interface.binding.subspan layout(#pipeline_layout_scatter) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : memref<32x1x19xf32, strided<[19, 19, 1], offset: ?>, #hal.descriptor_type<storage_buffer>>
+  %updates = hal.interface.binding.subspan layout(#pipeline_layout_scatter) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : memref<11x1x19xf32, strided<[19, 19, 1], offset: ?>, #hal.descriptor_type<storage_buffer>>
+  %indices = hal.interface.binding.subspan layout(#pipeline_layout_scatter) binding(2) alignment(64) offset(%c0) flags(ReadOnly) : memref<11xi32, strided<[1], offset: ?>, #hal.descriptor_type<storage_buffer>>
+  %out = hal.interface.binding.subspan layout(#pipeline_layout_scatter) binding(3) alignment(64) offset(%c0) : memref<32x1x19xf32, strided<[19, 19, 1], offset: ?>, #hal.descriptor_type<storage_buffer>>
+  %init_t = iree_codegen.load_from_buffer %init : memref<32x1x19xf32, strided<[19, 19, 1], offset: ?>, #hal.descriptor_type<storage_buffer>> -> tensor<32x1x19xf32>
+  %updates_t = iree_codegen.load_from_buffer %updates : memref<11x1x19xf32, strided<[19, 19, 1], offset: ?>, #hal.descriptor_type<storage_buffer>> -> tensor<11x1x19xf32>
+  %indices_t = iree_codegen.load_from_buffer %indices : memref<11xi32, strided<[1], offset: ?>, #hal.descriptor_type<storage_buffer>> -> tensor<11xi32>
+  %result = iree_linalg_ext.scatter dimension_map = [0] unique_indices(true)
+    ins(%updates_t, %indices_t : tensor<11x1x19xf32>, tensor<11xi32>)
+    outs(%init_t : tensor<32x1x19xf32>) {
+  ^bb0(%update: f32, %original: f32):
+    iree_linalg_ext.yield %update : f32
+  } -> tensor<32x1x19xf32>
+  iree_codegen.store_to_buffer %result, %out : tensor<32x1x19xf32> into memref<32x1x19xf32, strided<[19, 19, 1], offset: ?>, #hal.descriptor_type<storage_buffer>>
+  return
+}
+
+// CHECK-LABEL: func.func @scatter_readonly_init_distribute
+// CHECK-SAME:  #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<Distribute> workgroup_size = [64, 1, 1] subgroup_size = 32
+// CHECK:       iree_linalg_ext.scatter
+// CHECK-SAME:  lowering_config = #iree_codegen.lowering_config<tile_sizes = {{\[\[11, 1, 19\]\]}}>

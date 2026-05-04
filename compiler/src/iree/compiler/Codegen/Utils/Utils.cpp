@@ -948,6 +948,10 @@ isTiledAndDistributedLoop(scf::ForOp forOp) {
 }
 
 bool isComputeOp(Operation *op) {
+  if (isa<IREE::Codegen::LoadFromBufferOp, IREE::Codegen::StoreToBufferOp>(
+          op)) {
+    return false;
+  }
   return isa<TilingInterface, IREE::Codegen::UKernelOpInterface>(op);
 }
 

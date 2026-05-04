@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SMT/IR/SMTTypes.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
@@ -128,6 +129,74 @@ LogicalResult LoadFromBufferOp::reifyResultShapes(
   reifiedReturnShapes.resize(1);
   reifiedReturnShapes[0] = memref::getMixedSizes(b, getLoc(), getBuffer());
   return success();
+}
+
+SmallVector<utils::IteratorType> LoadFromBufferOp::getLoopIteratorTypes() {
+  return SmallVector<utils::IteratorType>(getTensor().getType().getRank(),
+                                          utils::IteratorType::parallel);
+}
+
+SmallVector<Range> LoadFromBufferOp::getIterationDomain(OpBuilder &builder) {
+  Location loc = getLoc();
+  OpFoldResult zero = builder.getIndexAttr(0);
+  OpFoldResult one = builder.getIndexAttr(1);
+  SmallVector<Range> ranges;
+  for (OpFoldResult size : memref::getMixedSizes(builder, loc, getBuffer())) {
+    ranges.push_back(Range{zero, size, one});
+  }
+  return ranges;
+}
+
+static FailureOr<TilingResult>
+createTiledLoadFromBuffer(OpBuilder &builder, Location loc, Value buffer,
+                          ArrayRef<OpFoldResult> offsets,
+                          ArrayRef<OpFoldResult> sizes) {
+  auto bufferType = cast<MemRefType>(buffer.getType());
+  if (offsets.size() != bufferType.getRank() ||
+      sizes.size() != bufferType.getRank()) {
+    return failure();
+  }
+
+  SmallVector<OpFoldResult> strides(bufferType.getRank(),
+                                    builder.getIndexAttr(1));
+  auto subview =
+      memref::SubViewOp::create(builder, loc, buffer, offsets, sizes, strides);
+  auto subviewType = cast<MemRefType>(subview.getType());
+  auto tensorType = RankedTensorType::get(subviewType.getShape(),
+                                          subviewType.getElementType());
+  auto tiledLoad = IREE::Codegen::LoadFromBufferOp::create(
+      builder, loc, tensorType, subview);
+  return TilingResult{{tiledLoad}, {tiledLoad.getTensor()}, {subview}};
+}
+
+FailureOr<TilingResult>
+LoadFromBufferOp::getTiledImplementation(OpBuilder &builder,
+                                         ArrayRef<OpFoldResult> offsets,
+                                         ArrayRef<OpFoldResult> sizes) {
+  return createTiledLoadFromBuffer(builder, getLoc(), getBuffer(), offsets,
+                                   sizes);
+}
+
+LogicalResult LoadFromBufferOp::getResultTilePosition(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  if (resultNumber != 0) {
+    return failure();
+  }
+  resultOffsets.assign(offsets.begin(), offsets.end());
+  resultSizes.assign(sizes.begin(), sizes.end());
+  return success();
+}
+
+FailureOr<TilingResult> LoadFromBufferOp::generateResultTileValue(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes) {
+  if (resultNumber != 0) {
+    return failure();
+  }
+  return createTiledLoadFromBuffer(builder, getLoc(), getBuffer(), offsets,
+                                   sizes);
 }
 
 //===----------------------------------------------------------------------===//

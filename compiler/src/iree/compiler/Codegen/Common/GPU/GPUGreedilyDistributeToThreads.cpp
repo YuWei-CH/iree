@@ -120,9 +120,10 @@ static void processRegion(RewriterBase &rewriter, Region *region) {
     SmallVector<Operation *> targetOps =
         llvm::map_to_vector(llvm::reverse(block.getOperations()),
                             [](Operation &op) { return &op; });
-    // Skip all unused ops (possibly from tiling).
+    // Skip all dead ops (possibly from tiling). Do not skip side-effecting
+    // ops with no results, e.g. workgroup foralls containing stores.
     for (Operation *op : targetOps) {
-      if (op->use_empty()) {
+      if (isOpTriviallyDead(op)) {
         continue;
       }
       // Skip all operations contained within an `scf.forall` mapped to threads

@@ -206,7 +206,13 @@ def IREECodegen_NullPointerOp :
 def IREECodegen_LoadFromBufferOp : Op<IREECodegen_Dialect, "load_from_buffer",
     [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
      DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface,
-       ["reifyResultShapes"]>]> {
+       ["reifyResultShapes"]>,
+     DeclareOpInterfaceMethods<TilingInterface,
+       ["getIterationDomain",
+        "getLoopIteratorTypes",
+        "getTiledImplementation",
+        "getResultTilePosition",
+        "generateResultTileValue"]>]> {
   let summary = [{Loads a tensor from a memref.}];
   let description = [{
     Loads a tensor from a memref with a compatible shape and the same element

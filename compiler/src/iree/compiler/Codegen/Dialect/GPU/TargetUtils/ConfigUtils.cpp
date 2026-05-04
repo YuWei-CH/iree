@@ -18,6 +18,7 @@
 #include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
@@ -26,6 +27,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/InterleavedRange.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Attributes.h"
@@ -1623,6 +1625,108 @@ LogicalResult setTileAndFuseLoweringConfig(IREE::GPU::TargetAttr target,
                             {flatWorkgroupSize, 1, 1}, subgroupSize));
 }
 
+static bool isReadOnlyInterfaceBuffer(Value value) {
+  auto load = value.getDefiningOp<IREE::Codegen::LoadFromBufferOp>();
+  if (!load) {
+    return false;
+  }
+  std::optional<IREE::HAL::InterfaceBindingSubspanOp> subspan =
+      getSourceSubspanMemref(cast<TypedValue<MemRefType>>(load.getBuffer()));
+  if (!subspan) {
+    return false;
+  }
+  std::optional<IREE::HAL::DescriptorFlags> descriptorFlags =
+      subspan->getDescriptorFlags();
+  return descriptorFlags.has_value() &&
+         bitEnumContainsAll(*descriptorFlags,
+                            IREE::HAL::DescriptorFlags::ReadOnly);
+}
+
+static int64_t getStaticScatterResultTileBytes(
+    IREE::LinalgExt::ScatterOp scatter, ArrayRef<int64_t> tileSizes) {
+  ShapedType originalType = scatter.getOriginalType();
+  int64_t originalRank = originalType.getRank();
+  int64_t updateRank = scatter.getUpdateType().getRank();
+  int64_t updateSliceRank = scatter.getUpdateSliceRank();
+  int64_t loopOffset = originalRank - updateRank;
+  int64_t firstTiledOriginalDim = originalRank - updateSliceRank;
+
+  int64_t elementBits = originalType.getElementTypeBitWidth();
+  int64_t tileBits = elementBits;
+  for (int64_t dim = 0; dim < originalRank; ++dim) {
+    int64_t dimSize = ShapedType::kDynamic;
+    if (dim < firstTiledOriginalDim) {
+      dimSize = originalType.getDimSize(dim);
+    } else {
+      int64_t loopDim = dim - loopOffset;
+      if (loopDim < 0 || loopDim >= static_cast<int64_t>(tileSizes.size())) {
+        return ShapedType::kDynamic;
+      }
+      dimSize = tileSizes[loopDim];
+    }
+    if (ShapedType::isDynamic(dimSize)) {
+      return ShapedType::kDynamic;
+    }
+    tileBits *= dimSize;
+  }
+  return llvm::divideCeil(tileBits, int64_t{8});
+}
+
+static SmallVector<int64_t> getBudgetedScatterDistributeTileSizes(
+    IREE::GPU::TargetAttr target, IREE::LinalgExt::ScatterOp scatter,
+    ArrayRef<int64_t> loopBounds) {
+  SmallVector<int64_t> tileSizes(loopBounds);
+  int64_t memoryLimit = target.getWgp().getMaxWorkgroupMemoryBytes();
+  int64_t tileBytes = getStaticScatterResultTileBytes(scatter, tileSizes);
+  if (ShapedType::isDynamic(tileBytes) || tileBytes <= memoryLimit) {
+    return tileSizes;
+  }
+
+  ShapedType originalType = scatter.getOriginalType();
+  int64_t originalRank = originalType.getRank();
+  int64_t updateRank = scatter.getUpdateType().getRank();
+  int64_t updateSliceRank = scatter.getUpdateSliceRank();
+  int64_t loopOffset = originalRank - updateRank;
+  int64_t firstTiledOriginalDim = originalRank - updateSliceRank;
+
+  for (int64_t dim = originalRank - 1;
+       dim >= firstTiledOriginalDim && tileBytes > memoryLimit; --dim) {
+    int64_t loopDim = dim - loopOffset;
+    if (loopDim < 0 || loopDim >= static_cast<int64_t>(tileSizes.size()) ||
+        tileSizes[loopDim] <= 1) {
+      continue;
+    }
+    int64_t bytesPerElement = tileBytes / tileSizes[loopDim];
+    if (bytesPerElement <= 0) {
+      continue;
+    }
+    int64_t budgetedTileSize =
+        std::max<int64_t>(1, memoryLimit / bytesPerElement);
+    tileSizes[loopDim] = std::min(tileSizes[loopDim], budgetedTileSize);
+    tileBytes = getStaticScatterResultTileBytes(scatter, tileSizes);
+  }
+
+  return tileSizes;
+}
+
+static LogicalResult setScatterDistributeLoweringConfig(
+    IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
+    IREE::LinalgExt::ScatterOp scatter, ArrayRef<int64_t> loopBounds,
+    int64_t flatWorkgroupSize) {
+  if (llvm::any_of(loopBounds, ShapedType::isDynamic)) {
+    return failure();
+  }
+  TileSizesListType tileSizes = {
+      getBudgetedScatterDistributeTileSizes(target, scatter, loopBounds)};
+  std::array<int64_t, 3> workgroupSize = {2 * flatWorkgroupSize, 1, 1};
+  auto loweringConfig =
+      IREE::Codegen::LoweringConfigAttr::get(scatter.getContext(), tileSizes);
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPoint, scatter, loweringConfig,
+      getGPUTranslationInfo(scatter.getContext(), LoweringPipeline::Distribute,
+                            workgroupSize, flatWorkgroupSize));
+}
+
 LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
                                        mlir::FunctionOpInterface entryPoint,
                                        Operation *op) {
@@ -1643,6 +1747,16 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
 
   // Configurations we need to decide.
   int64_t flatWorkgroupSize = target.getPreferredSubgroupSize();
+
+  // TileAndFuse bufferization cannot currently materialize the copy required
+  // for value-semantic scatter inits that come from read-only interface
+  // bindings. Use the distribute path, which can lower these scatters without
+  // introducing an in-place write to the read-only source.
+  if (isReadOnlyInterfaceBuffer(scatter.getOriginal())) {
+    return setScatterDistributeLoweringConfig(target, entryPoint, scatter,
+                                              loopBounds, flatWorkgroupSize);
+  }
+
   SmallVector<int64_t> workgroupTileSizes(loopDepth, 1);
   SmallVector<int64_t> threadTileSizes(loopDepth, 1);
   int64_t vectorSize = kPreferredCopyNumBits / elemBits;
@@ -1704,7 +1818,8 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
     // If the inner most slice is a single element then we have to bail out.
     // TODO: Support this case.
     if (!hasNonUnitInnerSlice) {
-      return failure();
+      return setScatterDistributeLoweringConfig(target, entryPoint, scatter,
+                                                loopBounds, flatWorkgroupSize);
     }
   }
 

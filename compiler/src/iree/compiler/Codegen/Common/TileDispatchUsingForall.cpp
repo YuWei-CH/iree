@@ -7,6 +7,7 @@
 #include "iree/compiler/Codegen/Common/TileAndFuseUtils.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
@@ -15,6 +16,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -191,6 +193,55 @@ static bool areAllStaticLoopBounds(scf::ForallOp forallOp) {
 /// consumer in perfect tiling scenario.
 static bool isAllowedToFailOnCunsumerFusion(Operation *op) {
   return isa<linalg::PackOp>(op);
+}
+
+/// Fuse a boundary store of a tiled forall result into the forall body. This
+/// lets canonicalization erase now-unused forall results/shared_outs, avoiding
+/// full-tensor temporaries before bufferization.
+static LogicalResult fuseStoreToBufferConsumer(RewriterBase &rewriter,
+                                               scf::ForallOp forallOp) {
+  SmallVector<IREE::Codegen::StoreToBufferOp> storesToErase;
+
+  for (OpResult result : forallOp.getResults()) {
+    if (!llvm::hasSingleElement(result.getUses())) {
+      continue;
+    }
+    Operation *user = result.getUses().begin()->getOwner();
+    auto storeOp = dyn_cast<IREE::Codegen::StoreToBufferOp>(user);
+    if (!storeOp || storeOp.getTensor() != result) {
+      continue;
+    }
+
+    OpOperand *tiedOperand = forallOp.getTiedOpOperand(result);
+    BlockArgument tiedBlockArg = forallOp.getTiedBlockArgument(tiedOperand);
+    SmallVector<Operation *> combiningOps =
+        forallOp.getCombiningOps(tiedBlockArg);
+    if (!llvm::hasSingleElement(combiningOps)) {
+      continue;
+    }
+
+    auto insertSliceOp =
+        dyn_cast<tensor::ParallelInsertSliceOp>(combiningOps.front());
+    if (!insertSliceOp ||
+        !llvm::all_of(insertSliceOp.getMixedStrides(), isOneInteger)) {
+      continue;
+    }
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(forallOp.getTerminator());
+    auto bufferTile = memref::SubViewOp::create(
+        rewriter, storeOp.getLoc(), storeOp.getBuffer(),
+        insertSliceOp.getMixedOffsets(), insertSliceOp.getMixedSizes(),
+        insertSliceOp.getMixedStrides());
+    IREE::Codegen::StoreToBufferOp::create(
+        rewriter, storeOp.getLoc(), insertSliceOp.getSource(), bufferTile);
+    storesToErase.push_back(storeOp);
+  }
+
+  for (IREE::Codegen::StoreToBufferOp storeOp : storesToErase) {
+    rewriter.eraseOp(storeOp);
+  }
+  return success();
 }
 
 /// Returns true if all the compute ops are within scf.forall distribution
@@ -393,6 +444,11 @@ void TileAndDistributeToWorkgroupsUsingForallOpPass::runOnOperation() {
     if (tilingLoops.size() != 1 || !isa<scf::ForallOp>(tilingLoops[0])) {
       funcOp.emitOpError(
           "expected tiling to produce a single `scf.forall` loop");
+      return signalPassFailure();
+    }
+
+    if (failed(fuseStoreToBufferConsumer(
+            rewriter, cast<scf::ForallOp>(tilingLoops[0])))) {
       return signalPassFailure();
     }
 

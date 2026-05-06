@@ -180,6 +180,10 @@ static bool isROCmBackend(IREE::GPU::TargetAttr target) {
   return target.getArch().starts_with("gfx");
 }
 
+static bool isCUDABackend(IREE::GPU::TargetAttr target) {
+  return target.getArch().starts_with("sm_");
+}
+
 static bool needsLoweringConfigPropagation(Attribute pipelineAttr) {
   auto gpuPipeline = dyn_cast_if_present<IREE::GPU::PipelineAttr>(pipelineAttr);
   if (!gpuPipeline) {
@@ -1660,6 +1664,117 @@ static LogicalResult setContractConfig(IREE::GPU::TargetAttr target,
 
     // SIMT matmul case. Query the best configuration.
     SmallVector<TileWorkgroupSizePair> tileSizeConfig = getMatmulConfig(target);
+    auto isDegenerateUnitTile = [&](const TileWorkgroupSizePair &config) {
+      return (config.tileSize[0] == 1 && sizeM > kVerySkinnyDimThreshold) ||
+             (config.tileSize[1] == 1 && sizeN > kVerySkinnyDimThreshold);
+    };
+
+    struct ScoredMatmulConfig {
+      int64_t tileX;
+      int64_t tileY;
+      int64_t tileK;
+      std::array<int64_t, 3> workgroupSize;
+      int64_t outputWaste;
+      int64_t workgroupCountPenalty;
+      int64_t tileArea;
+      int64_t threadCount;
+    };
+
+    auto ceilDiv = [](int64_t lhs, int64_t rhs) {
+      return (lhs + rhs - 1) / rhs;
+    };
+    auto adjustTileK = [&](int64_t tileK) {
+      while (tileK > 1 && sizeK % tileK != 0) {
+        tileK >>= 1;
+      }
+      return tileK;
+    };
+    auto isBetterConfig = [](const ScoredMatmulConfig &lhs,
+                             const ScoredMatmulConfig &rhs) {
+      if (lhs.outputWaste != rhs.outputWaste) {
+        return lhs.outputWaste < rhs.outputWaste;
+      }
+      if (lhs.workgroupCountPenalty != rhs.workgroupCountPenalty) {
+        return lhs.workgroupCountPenalty < rhs.workgroupCountPenalty;
+      }
+      if (lhs.tileK != rhs.tileK) {
+        return lhs.tileK > rhs.tileK;
+      }
+      if (lhs.tileArea != rhs.tileArea) {
+        return lhs.tileArea > rhs.tileArea;
+      }
+      return lhs.threadCount > rhs.threadCount;
+    };
+
+    bool hasSmallOutputDim = sizeM <= target.getPreferredSubgroupSize() ||
+                             sizeN <= target.getPreferredSubgroupSize();
+    bool isSingleStaticCUDAMatmul =
+        isCUDABackend(target) &&
+        llvm::all_equal({contractionDims->m.size(), contractionDims->n.size(),
+                         contractionDims->k.size(), size_t{1}}) &&
+        contractionDims->batch.empty();
+    if (isSingleStaticCUDAMatmul && hasSmallOutputDim && sizeK >= 1024) {
+      int64_t outputElements = sizeM * sizeN;
+      int64_t targetWorkgroupCount = std::max<int64_t>(
+          2, std::min<int64_t>(64, ceilDiv(outputElements, 512)));
+      std::optional<ScoredMatmulConfig> bestConfig;
+      for (TileWorkgroupSizePair &config : tileSizeConfig) {
+        int64_t tileX = config.tileSize[0];
+        int64_t tileY = config.tileSize[1];
+        int64_t tileK = adjustTileK(config.tileSize[2]);
+        if (sizeM <= target.getPreferredSubgroupSize()) {
+          tileX = sizeM;
+        }
+        if (sizeN <= target.getPreferredSubgroupSize()) {
+          tileY = sizeN;
+        }
+        if (sizeM <= target.getPreferredSubgroupSize() &&
+            sizeN <= target.getPreferredSubgroupSize() &&
+            sizeM * sizeN > target.getPreferredSubgroupSize()) {
+          tileY = std::min<int64_t>(tileY, config.workgroupSize[1]);
+        } else if (sizeM <= target.getPreferredSubgroupSize()) {
+          tileY = std::min<int64_t>(tileY, target.getPreferredSubgroupSize());
+        } else if (sizeN <= target.getPreferredSubgroupSize()) {
+          tileX = std::min<int64_t>(tileX, target.getPreferredSubgroupSize());
+        }
+        if (tileX <= 0 || tileY <= 0 || tileK <= 0) {
+          continue;
+        }
+        TileWorkgroupSizePair adjustedConfig = {
+            {tileX, tileY, tileK}, config.workgroupSize, config.pipelineDepth};
+        if (isDegenerateUnitTile(adjustedConfig)) {
+          continue;
+        }
+        int64_t workgroupCount = ceilDiv(sizeM, tileX) * ceilDiv(sizeN, tileY);
+        int64_t tiledOutputElements =
+            ceilDiv(sizeM, tileX) * tileX * ceilDiv(sizeN, tileY) * tileY;
+        int64_t workgroupCountPenalty =
+            workgroupCount > targetWorkgroupCount
+                ? workgroupCount - targetWorkgroupCount
+                : targetWorkgroupCount - workgroupCount;
+        ScoredMatmulConfig scoredConfig{tileX,
+                                        tileY,
+                                        tileK,
+                                        config.workgroupSize,
+                                        tiledOutputElements - outputElements,
+                                        workgroupCountPenalty,
+                                        tileX * tileY,
+                                        config.workgroupSize[0] *
+                                            config.workgroupSize[1] *
+                                            config.workgroupSize[2]};
+        if (!bestConfig || isBetterConfig(scoredConfig, *bestConfig)) {
+          bestConfig = scoredConfig;
+        }
+      }
+      if (bestConfig) {
+        return setMatmulConfig(
+            bestConfig->tileX, bestConfig->tileY, bestConfig->tileK,
+            bestConfig->workgroupSize,
+            target.getWgp().getSubgroupSizeChoices().asArrayRef(),
+            softwarePipelineDepthSimt, GPUPipeline::TileAndFuse);
+      }
+    }
+
     // Pick the best configuration where the original shape is aligned on the
     // tile size.
     for (TileWorkgroupSizePair &config : tileSizeConfig) {

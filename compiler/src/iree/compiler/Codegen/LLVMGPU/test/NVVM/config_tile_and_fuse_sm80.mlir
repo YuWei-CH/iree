@@ -91,3 +91,70 @@ func.func @matmul_accumulate_256x256x256_f16_f32() {
 //       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
 //  CHECK-SAME:     convert_acc_gemm
 //  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<NV_MMA_SYNC_F32_16x8x16_F16>
+
+// -----
+
+// Qwen prefill uses short-prompt mixed precision matmuls with M=19. Keep the
+// workgroup tile narrow in both M and N to avoid too much serial N work per
+// workgroup.
+func.func @mixed_precision_short_m_matmul_19x2048x6144_f32xbf16xf32(
+    %lhs: tensor<19x6144xf32>,
+    %rhs: tensor<6144x2048xbf16>) -> tensor<19x2048xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<19x2048xf32>
+  %fill = linalg.fill ins(%cst : f32) outs(%empty : tensor<19x2048xf32>) -> tensor<19x2048xf32>
+  %result = linalg.generic {
+    indexing_maps = [
+      affine_map<(d0, d1, d2) -> (d0, d2)>,
+      affine_map<(d0, d1, d2) -> (d2, d1)>,
+      affine_map<(d0, d1, d2) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel", "reduction"]}
+    ins(%lhs, %rhs : tensor<19x6144xf32>, tensor<6144x2048xbf16>)
+    outs(%fill : tensor<19x2048xf32>) {
+  ^bb0(%in: f32, %in_0: bf16, %out: f32):
+    %0 = arith.extf %in_0 : bf16 to f32
+    %1 = arith.mulf %in, %0 : f32
+    %2 = arith.addf %out, %1 : f32
+    linalg.yield %2 : f32
+  } -> tensor<19x2048xf32>
+  return %result : tensor<19x2048xf32>
+}
+
+// CHECK-LABEL: func.func @mixed_precision_short_m_matmul_19x2048x6144_f32xbf16xf32(
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 8, 1] subgroup_size = 32
+//       CHECK:   linalg.generic {{.*}}lowering_config = #iree_gpu.lowering_config<{{[{]}}reduction = [0, 0, 32]
+//  CHECK-SAME:     thread = [1, 4, 0]
+//  CHECK-SAME:     workgroup = [19, 32, 1]
+
+// -----
+
+// Qwen prefill also contains small-output mixed precision matmuls, such as
+// M=19, N=16. Keep the N tile small instead of using a broad 128-wide fallback.
+func.func @mixed_precision_small_output_matmul_19x16x2048_f32xbf16xf32(
+    %lhs: tensor<19x2048xf32>,
+    %rhs: tensor<2048x16xbf16>) -> tensor<19x16xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<19x16xf32>
+  %fill = linalg.fill ins(%cst : f32) outs(%empty : tensor<19x16xf32>) -> tensor<19x16xf32>
+  %result = linalg.generic {
+    indexing_maps = [
+      affine_map<(d0, d1, d2) -> (d0, d2)>,
+      affine_map<(d0, d1, d2) -> (d2, d1)>,
+      affine_map<(d0, d1, d2) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel", "reduction"]}
+    ins(%lhs, %rhs : tensor<19x2048xf32>, tensor<2048x16xbf16>)
+    outs(%fill : tensor<19x16xf32>) {
+  ^bb0(%in: f32, %in_0: bf16, %out: f32):
+    %0 = arith.extf %in_0 : bf16 to f32
+    %1 = arith.mulf %in, %0 : f32
+    %2 = arith.addf %out, %1 : f32
+    linalg.yield %2 : f32
+  } -> tensor<19x16xf32>
+  return %result : tensor<19x16xf32>
+}
+
+// CHECK-LABEL: func.func @mixed_precision_small_output_matmul_19x16x2048_f32xbf16xf32(
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 8, 1] subgroup_size = 32
+//       CHECK:   linalg.generic {{.*}}lowering_config = #iree_gpu.lowering_config<{{[{]}}reduction = [0, 0, 32]
+//  CHECK-SAME:     thread = [1, 1, 0]
+//  CHECK-SAME:     workgroup = [19, 8, 1]

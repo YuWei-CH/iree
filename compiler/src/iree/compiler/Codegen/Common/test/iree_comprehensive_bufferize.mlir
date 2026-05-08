@@ -2860,6 +2860,43 @@ func.func @load_from_buffer_store_to_buffer_in_place() {
 
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+func.func @load_from_read_only_forall_init_fully_overwritten() {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) : memref<1x4x8xf32, #hal.descriptor_type<storage_buffer>>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : memref<1x4x8xf32, #hal.descriptor_type<storage_buffer>>
+  %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : memref<1x4x8xf32, #hal.descriptor_type<storage_buffer>>
+  %3 = iree_codegen.load_from_buffer %0 : memref<1x4x8xf32, #hal.descriptor_type<storage_buffer>> -> tensor<1x4x8xf32>
+  %4 = iree_codegen.load_from_buffer %1 : memref<1x4x8xf32, #hal.descriptor_type<storage_buffer>> -> tensor<1x4x8xf32>
+  %forall = scf.forall (%arg0) in (4) shared_outs(%arg1 = %4) -> (tensor<1x4x8xf32>) {
+    %extracted_slice = tensor.extract_slice %arg1[0, %arg0, 0] [1, 1, 8] [1, 1, 1] : tensor<1x4x8xf32> to tensor<1x1x8xf32>
+    %5 = vector.transfer_read %3[%c0, %arg0, %c0], %cst {in_bounds = [true, true, true]} : tensor<1x4x8xf32>, vector<1x1x8xf32>
+    %6 = vector.transfer_write %5, %extracted_slice[%c0, %c0, %c0] {in_bounds = [true, true, true]} : vector<1x1x8xf32>, tensor<1x1x8xf32>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %6 into %arg1[0, %arg0, 0] [1, 1, 8] [1, 1, 1] : tensor<1x1x8xf32> into tensor<1x4x8xf32>
+    }
+  } {mapping = [#iree_codegen.workgroup_mapping<x>]}
+  iree_codegen.store_to_buffer %forall, %2 : tensor<1x4x8xf32> into memref<1x4x8xf32, #hal.descriptor_type<storage_buffer>>
+  return
+}
+
+// CHECK-LABEL: func.func @load_from_read_only_forall_init_fully_overwritten()
+//   CHECK-DAG:   %[[INPUT:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(0)
+//   CHECK-DAG:   %[[OUTPUT:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(2)
+//   CHECK-NOT:   memref.alloc
+//   CHECK-NOT:   linalg.generic
+//       CHECK:   scf.forall (%[[ARG0:.+]]) in (4)
+//       CHECK:     %[[OUTPUT_TILE:.+]] = memref.subview %[[OUTPUT]][0, %[[ARG0]], 0] [1, 1, 8] [1, 1, 1]
+//       CHECK:     vector.transfer_read %[[INPUT]]
+//       CHECK:     vector.transfer_write {{.*}}, %[[OUTPUT_TILE]]
+
+// -----
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
   #hal.pipeline.binding<storage_buffer>
 ]>
 func.func @load_from_buffer_read_only_copy() {

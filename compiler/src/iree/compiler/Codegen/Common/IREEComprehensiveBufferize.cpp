@@ -168,6 +168,225 @@ static IREEOneShotBufferizationOptions getBufferizationOptions() {
   return options;
 }
 
+static bool isReadOnlyInterfaceBuffer(Value value) {
+  auto loadOp = value.getDefiningOp<IREE::Codegen::LoadFromBufferOp>();
+  if (!loadOp) {
+    return false;
+  }
+  std::optional<IREE::HAL::InterfaceBindingSubspanOp> subspan =
+      getSourceSubspanMemref(cast<TypedValue<MemRefType>>(loadOp.getBuffer()));
+  if (!subspan) {
+    return false;
+  }
+  std::optional<IREE::HAL::DescriptorFlags> descriptorFlags =
+      subspan->getDescriptorFlags();
+  return descriptorFlags.has_value() &&
+         bitEnumContainsAll(*descriptorFlags,
+                            IREE::HAL::DescriptorFlags::ReadOnly);
+}
+
+static bool isAvailableBefore(Operation *op, Value value) {
+  Operation *definingOp = value.getDefiningOp();
+  if (!definingOp) {
+    return true;
+  }
+  return definingOp->getBlock() == op->getBlock() &&
+         definingOp->isBeforeInBlock(op);
+}
+
+static bool hasConstantIntValue(OpFoldResult value, int64_t expected) {
+  std::optional<int64_t> constant = getConstantIntValue(value);
+  return constant && *constant == expected;
+}
+
+static bool isFullOverwrite(vector::TransferWriteOp writeOp) {
+  if (writeOp.hasOutOfBoundsDim() || writeOp.getMask() ||
+      !writeOp.getPermutationMap().isIdentity()) {
+    return false;
+  }
+  VectorType vectorType = writeOp.getVectorType();
+  ShapedType destType = writeOp.getShapedType();
+  if (vectorType.getRank() != destType.getRank() ||
+      !destType.hasStaticShape()) {
+    return false;
+  }
+  if (!llvm::all_of(writeOp.getIndices(), [](Value index) {
+        return getConstantIntValue(index) == static_cast<int64_t>(0);
+      })) {
+    return false;
+  }
+  return llvm::equal(vectorType.getShape(), destType.getShape());
+}
+
+static std::optional<int64_t> getNormalizedTripCount(scf::ForallOp forallOp,
+                                                     unsigned dim) {
+  std::optional<int64_t> lowerBound =
+      getConstantIntValue(forallOp.getMixedLowerBound()[dim]);
+  std::optional<int64_t> upperBound =
+      getConstantIntValue(forallOp.getMixedUpperBound()[dim]);
+  std::optional<int64_t> step =
+      getConstantIntValue(forallOp.getMixedStep()[dim]);
+  if (!lowerBound || !upperBound || !step || *lowerBound != 0 || *step != 1) {
+    return std::nullopt;
+  }
+  return *upperBound;
+}
+
+static bool isForallResultCoveredByInsertSlice(
+    scf::ForallOp forallOp, tensor::ParallelInsertSliceOp insertOp) {
+  RankedTensorType destType = insertOp.getDestType();
+  Builder builder(forallOp.getContext());
+  SmallVector<OpFoldResult> mixedStrides = getMixedValues(
+      insertOp.getStaticStrides(), insertOp.getStrides(), builder);
+  if (!destType.hasStaticShape() ||
+      insertOp.getSourceType().getRank() != destType.getRank() ||
+      !areAllConstantIntValue(mixedStrides, 1)) {
+    return false;
+  }
+
+  SmallVector<Value> inductionVars = llvm::map_to_vector(
+      forallOp.getBody()->getArguments().take_front(forallOp.getRank()),
+      [](BlockArgument arg) -> Value { return arg; });
+  SmallVector<bool> usedInductionVars(inductionVars.size(), false);
+  ArrayRef<int64_t> destShape = destType.getShape();
+  SmallVector<OpFoldResult> mixedOffsets =
+      getMixedValues(insertOp.getStaticOffsets(), insertOp.getOffsets(),
+                     builder);
+  SmallVector<OpFoldResult> mixedSizes = getMixedValues(
+      insertOp.getStaticSizes(), insertOp.getSizes(), builder);
+  for (auto [dim, shape] : llvm::enumerate(destShape)) {
+    if (hasConstantIntValue(mixedOffsets[dim], 0) &&
+        hasConstantIntValue(mixedSizes[dim], shape)) {
+      continue;
+    }
+    if (!hasConstantIntValue(mixedSizes[dim], 1)) {
+      return false;
+    }
+    if (shape == 1 && hasConstantIntValue(mixedOffsets[dim], 0)) {
+      continue;
+    }
+
+    auto offset = llvm::dyn_cast_if_present<Value>(mixedOffsets[dim]);
+    if (!offset) {
+      return false;
+    }
+    std::optional<unsigned> inductionVarNumber;
+    for (auto [index, inductionVar] : llvm::enumerate(inductionVars)) {
+      if (inductionVar == offset) {
+        inductionVarNumber = index;
+        break;
+      }
+    }
+    if (!inductionVarNumber) {
+      return false;
+    }
+    if (usedInductionVars[*inductionVarNumber]) {
+      return false;
+    }
+    std::optional<int64_t> tripCount =
+        getNormalizedTripCount(forallOp, *inductionVarNumber);
+    if (!tripCount || *tripCount != shape) {
+      return false;
+    }
+    usedInductionVars[*inductionVarNumber] = true;
+  }
+
+  for (auto [index, used] : llvm::enumerate(usedInductionVars)) {
+    std::optional<int64_t> tripCount = getNormalizedTripCount(forallOp, index);
+    if (!tripCount || (*tripCount > 1 && !used)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool isForallResultFullyOverwritten(scf::ForallOp forallOp,
+                                           unsigned resultNumber) {
+  OpOperand &outputOperand = forallOp.getOutputsMutable()[resultNumber];
+  BlockArgument outputBlockArg = forallOp.getTiedBlockArgument(&outputOperand);
+  SmallVector<Operation *> combiningOps =
+      forallOp.getCombiningOps(outputBlockArg);
+  if (combiningOps.size() != 1) {
+    return false;
+  }
+  auto insertOp = dyn_cast<tensor::ParallelInsertSliceOp>(combiningOps[0]);
+  if (!insertOp || insertOp.getDest() != outputBlockArg) {
+    return false;
+  }
+  if (!isForallResultCoveredByInsertSlice(forallOp, insertOp)) {
+    return false;
+  }
+
+  auto writeOp = insertOp.getSource().getDefiningOp<vector::TransferWriteOp>();
+  if (!writeOp || !isFullOverwrite(writeOp)) {
+    return false;
+  }
+  auto extractOp = writeOp.getBase().getDefiningOp<tensor::ExtractSliceOp>();
+  if (!extractOp || extractOp.getSource() != outputBlockArg) {
+    return false;
+  }
+
+  for (OpOperand &use : outputBlockArg.getUses()) {
+    Operation *owner = use.getOwner();
+    if (owner == extractOp.getOperation()) {
+      continue;
+    }
+    if (owner == insertOp.getOperation() && &use == &insertOp.getDestMutable()) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/// One-Shot Bufferize may preserve tensor semantics for an scf.forall init that
+/// comes from a read-only interface binding by inserting an alloc_tensor copy.
+/// If the forall fully overwrites the tied result, the init contents are dead.
+/// Use the final store destination as the forall init so bufferization can write
+/// directly to the dispatch output.
+static void useDestinationForFullyOverwrittenReadOnlyForallInits(
+    RewriterBase &rewriter, mlir::FunctionOpInterface funcOp) {
+  SmallVector<IREE::Codegen::StoreToBufferOp> storeOps;
+  funcOp.walk([&](IREE::Codegen::StoreToBufferOp storeOp) {
+    storeOps.push_back(storeOp);
+  });
+
+  for (IREE::Codegen::StoreToBufferOp storeOp : storeOps) {
+    auto forallResult = dyn_cast<OpResult>(storeOp.getTensor());
+    if (!forallResult) {
+      continue;
+    }
+    auto forallOp = dyn_cast<scf::ForallOp>(forallResult.getDefiningOp());
+    if (!forallOp) {
+      continue;
+    }
+
+    unsigned resultNumber = forallResult.getResultNumber();
+    Value init = forallOp.getOutputs()[resultNumber];
+    if (!isReadOnlyInterfaceBuffer(init)) {
+      continue;
+    }
+    if (!isForallResultFullyOverwritten(forallOp, resultNumber)) {
+      continue;
+    }
+
+    Value destinationBuffer = storeOp.getBuffer();
+    auto initLoadOp = init.getDefiningOp<IREE::Codegen::LoadFromBufferOp>();
+    if (initLoadOp.getBuffer() == destinationBuffer ||
+        !destinationBuffer.hasOneUse() ||
+        !isAvailableBefore(forallOp, destinationBuffer)) {
+      continue;
+    }
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(forallOp);
+    Location loc = forallOp.getLoc();
+    Value destinationTensor = IREE::Codegen::LoadFromBufferOp::create(
+        rewriter, loc, init.getType(), destinationBuffer);
+    forallOp.getOutputsMutable()[resultNumber].set(destinationTensor);
+  }
+}
+
 LogicalResult
 eliminateEmptyTensors(RewriterBase &rewriter, Operation *op,
                       const OneShotBufferizationOptions &options) {
@@ -287,6 +506,8 @@ void IREEComprehensiveBufferizePass::runOnOperation() {
                                         gpu::AddressSpace::Constant);
     };
   }
+
+  useDestinationForFullyOverwrittenReadOnlyForallInits(rewriter, funcOp);
 
   bufferization::BufferizationState bufferizationState;
   if (failed(runIREEOneShotBufferize(funcOp, options, bufferizationState))) {

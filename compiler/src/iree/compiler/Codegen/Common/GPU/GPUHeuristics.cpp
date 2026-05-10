@@ -261,7 +261,7 @@ static FailureOr<GPUMMASchedule> fitScheduleInSharedMemory(
 }
 
 static LogicalResult canTargetIntrinsic(const GPUMatmulShapeType &problem,
-                                        const GPUMatmulShapeType &intrinsic,
+                                        const GPUIntrinsicType &intrinsic,
                                         int64_t preferredSubgroupSize,
                                         bool canUpcastAcc, bool mustBeAligned) {
   assert(intrinsic.mSizes.size() == 1 && intrinsic.nSizes.size() == 1 &&
@@ -271,6 +271,15 @@ static LogicalResult canTargetIntrinsic(const GPUMatmulShapeType &problem,
     return failure(); // Cannot use this intrinsic for mismatched types
   }
   if (problem.cType != intrinsic.cType) {
+    // The CUDA BF16 mma.sync intrinsic currently has downstream lowering
+    // coverage for f32 results only. Do not let accumulator-upcast selection
+    // use it for bf16-result problems until the result conversion is legal.
+    auto mma = dyn_cast<IREE::GPU::MMAAttr>(intrinsic.mmaKind);
+    if (mma &&
+        mma.getIntrinsic() ==
+            IREE::GPU::MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_BF16) {
+      return failure();
+    }
     bool isFpCase =
         isa<FloatType>(problem.cType) && isa<FloatType>(intrinsic.cType);
     bool isUpcast = problem.cType.getIntOrFloatBitWidth() <

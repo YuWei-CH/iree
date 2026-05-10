@@ -91,3 +91,36 @@ func.func @matmul_accumulate_256x256x256_f16_f32() {
 //       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
 //  CHECK-SAME:     convert_acc_gemm
 //  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<NV_MMA_SYNC_F32_16x8x16_F16>
+
+// -----
+
+// The local CUDA BF16 MMA capability currently only supports f32 results.
+// Verify that bf16-output matmuls reject the upcasted BF16 MMA candidate before
+// selecting an invalid VectorDistribute config.
+#pipeline_layout_bf16_out = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+func.func @qwen_projection_bf16_output_matmul() {
+  %cst = arith.constant 0.000000e+00 : bf16
+  %c0 = arith.constant 0 : index
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout_bf16_out) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<512x2048xbf16>>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout_bf16_out) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2048x16xbf16>>
+  %2 = hal.interface.binding.subspan layout(#pipeline_layout_bf16_out) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<512x16xbf16>>
+  %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [512, 2048], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<512x2048xbf16>> -> tensor<512x2048xbf16>
+  %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [2048, 16], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2048x16xbf16>> -> tensor<2048x16xbf16>
+  %5 = tensor.empty() : tensor<512x16xbf16>
+  %6 = linalg.fill ins(%cst : bf16) outs(%5 : tensor<512x16xbf16>) -> tensor<512x16xbf16>
+  %7 = linalg.matmul ins(%3, %4 : tensor<512x2048xbf16>, tensor<2048x16xbf16>) outs(%6 : tensor<512x16xbf16>) -> tensor<512x16xbf16>
+  iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [512, 16], strides = [1, 1] : tensor<512x16xbf16> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<512x16xbf16>>
+  return
+}
+
+// CHECK-LABEL: func.func @qwen_projection_bf16_output_matmul(
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
+//       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
+//  CHECK-SAME:     reduction = [0, 0, 32]
+//  CHECK-SAME:     thread = [1, 16, 0]
+//  CHECK-SAME:     workgroup = [32, 128, 1]
+//  CHECK-NOT:    #iree_gpu.pipeline<VectorDistribute>

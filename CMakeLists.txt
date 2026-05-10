@@ -497,6 +497,7 @@ cmake_dependent_option(IREE_TARGET_BACKEND_WEBGPU_SPIRV "Enables the 'webgpu' co
 cmake_dependent_option(IREE_INPUT_STABLEHLO "Builds support for compiling StableHLO programs" ON ${IREE_BUILD_COMPILER} OFF)
 cmake_dependent_option(IREE_INPUT_TORCH "Builds support for compiling Torch MLIR programs" ON ${IREE_BUILD_COMPILER} OFF)
 cmake_dependent_option(IREE_INPUT_TOSA "Builds support for compiling TOSA programs" ON ${IREE_BUILD_COMPILER} OFF)
+cmake_dependent_option(IREE_INPUT_APPROX "Builds support for compiling Approx programs" ON ${IREE_BUILD_COMPILER} OFF)
 
 if(IREE_BUILD_COMPILER)
   message(STATUS "IREE compiler input dialects:")
@@ -508,6 +509,9 @@ if(IREE_BUILD_COMPILER)
   endif()
   if(IREE_INPUT_TOSA)
     message(STATUS "  - TOSA")
+  endif()
+  if(IREE_INPUT_APPROX)
+    message(STATUS "  - Approx")
   endif()
 endif()
 
@@ -1102,6 +1106,8 @@ if(IREE_TARGET_BACKEND_METAL_SPIRV)
 
   iree_add_spirv_cross_subdirectory()
 endif()
+
+add_subdirectory(third_party/approxMLIR EXCLUDE_FROM_ALL)
 
 #-------------------------------------------------------------------------------
 # IREE top-level libraries
